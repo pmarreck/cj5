@@ -1,0 +1,16 @@
+.{
+    .name = .cj5,
+    .fingerprint = 0x7c71eb659b9eefc0,
+    .version = "1.0.0",
+    .minimum_zig_version = "0.14.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "cj5.c",
+        "cj5.h",
+        "cj5.zig",
+        "flake.nix",
+        "LICENSE",
+        "README.md",
+    },
+}

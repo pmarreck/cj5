@@ -72,3 +72,7 @@ temp
 *.obj
 
 *.etl
+
+# Zig
+.zig-cache/
+zig-out/
