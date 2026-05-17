@@ -15,13 +15,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    lib.addCSourceFile(.{
+    lib.root_module.addCSourceFile(.{
         .file = b.path("cj5.c"),
         .flags = &.{"-std=c99"},
     });
 
     // Add include path so @cImport can find cj5.h
-    lib.addIncludePath(b.path("."));
+    lib.root_module.addIncludePath(b.path("."));
     lib.installHeader(b.path("cj5.h"), "cj5.h");
 
     b.installArtifact(lib);
@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    tests.linkLibrary(lib);
+    tests.root_module.linkLibrary(lib);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run cj5 tests");
