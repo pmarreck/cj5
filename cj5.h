@@ -658,6 +658,15 @@ cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_toke
             if (!tokens || r.error == CJ5_ERROR_OVERFLOW) {
                 break;
             }
+            // JSON5: a 'key:' must be followed by a value before the container
+            // closes. If super_id still points to a key string with no value
+            // attached (size == 0), the value is missing -> invalid.
+            if (parser.super_id != -1 &&
+                tokens[parser.super_id].type == CJ5_TOKEN_STRING &&
+                tokens[parser.super_id].size == 0) {
+                cj5__set_error(&r, CJ5_ERROR_INVALID, parser.line, parser.pos - parser.line);
+                return r;
+            }
             type = (c == '}' ? CJ5_TOKEN_OBJECT : CJ5_TOKEN_ARRAY);
 
             if (parser.next_id < 1) {
@@ -730,10 +739,18 @@ cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_toke
 
         case ',':
             can_comment = false;
-            if (tokens != NULL && parser.super_id != -1 && r.error != CJ5_ERROR_OVERFLOW &&
-                tokens[parser.super_id].type != CJ5_TOKEN_ARRAY &&
-                tokens[parser.super_id].type != CJ5_TOKEN_OBJECT) {
-                parser.super_id = tokens[parser.super_id].parent_id;
+            if (tokens != NULL && parser.super_id != -1 && r.error != CJ5_ERROR_OVERFLOW) {
+                // Missing value: 'key:' immediately followed by ',' leaves super_id
+                // on a size-0 key string -> invalid JSON5.
+                if (tokens[parser.super_id].type == CJ5_TOKEN_STRING &&
+                    tokens[parser.super_id].size == 0) {
+                    cj5__set_error(&r, CJ5_ERROR_INVALID, parser.line, parser.pos - parser.line);
+                    return r;
+                }
+                if (tokens[parser.super_id].type != CJ5_TOKEN_ARRAY &&
+                    tokens[parser.super_id].type != CJ5_TOKEN_OBJECT) {
+                    parser.super_id = tokens[parser.super_id].parent_id;
+                }
             }
             break;
         case '/':
