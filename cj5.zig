@@ -357,3 +357,25 @@ test "isValid/validate are lenient on token overflow (pins current behavior)" {
     try std.testing.expect(isValid(big));
     try std.testing.expect(validate(big).valid);
 }
+
+test "whitespace between unquoted key and colon is valid (JSON5)" {
+    // JSON5 (and JSON) allow arbitrary whitespace between a key and its ':'.
+    try std.testing.expect(isValid("{a : 1}")); // space before colon
+    try std.testing.expect(isValid("{a: 1, b : 2}")); // second member
+    try std.testing.expect(isValid("{ foo : 'x' , bar : 2 }")); // spaces everywhere
+    try std.testing.expect(isValid("{a\t: 1}")); // tab before colon
+    try std.testing.expect(isValid("{a\n: 1}")); // newline before colon
+
+    // The key must still parse to the correct slice, not just report "valid".
+    const json = "{a : 1}";
+    var tokens: [16]Token = undefined;
+    const r = try parse(json, &tokens);
+    try expectEqual(@as(usize, 3), r.num_tokens);
+    try expectKey(&r, 1, "a");
+    const v = r.getToken(2).?;
+    try expectEqual(NumberType.int_, v.data.num_type);
+    try expectEqualStrings("1", v.getValue(json).?);
+
+    // Regression guard: a missing value with whitespace is still invalid.
+    try std.testing.expect(!isValid("{a : }"));
+}

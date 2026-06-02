@@ -404,6 +404,22 @@ static bool cj5__parse_primitive(cj5__parser* parser, cj5_result* r, const char*
     return false;
 
 found:
+    // JSON5 allows whitespace between an unquoted key and its ':'. If the scan
+    // stopped on whitespace, look ahead past it: a following ':' means this
+    // token is a key name, not a value (matching the ':'-terminated case above).
+    if (!keyname) {
+        for (int i = parser->pos; i < len; i++) {
+            char nc = json5[i];
+            if (nc == ' ' || nc == '\t' || nc == '\r' || nc == '\n') {
+                continue;
+            }
+            if (nc == ':') {
+                keyname = true;
+            }
+            break;
+        }
+    }
+
     token = cj5__alloc_token(parser, tokens, max_tokens);
     if (token == NULL) {
         r->error = CJ5_ERROR_OVERFLOW;
