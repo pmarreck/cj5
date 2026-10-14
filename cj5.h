@@ -150,6 +150,7 @@ typedef struct cj5_result {
     cj5_error_code error;
     int error_line;
     int error_col;
+    int error_offset;   // byte offset into json5 where the error was detected
     int num_tokens;
     const cj5_token* tokens;
     const char* json5;
@@ -373,9 +374,10 @@ static inline cj5_token* cj5__alloc_token(cj5__parser* parser)
     return token;
 }
 
-static inline void cj5__set_error(cj5_result* r, cj5_error_code code, int line, int col)
+static inline void cj5__set_error(cj5_result* r, cj5_error_code code, int pos, int line, int col)
 {
     r->error = code;
+    r->error_offset = pos;
     r->error_line = line + 1;
     r->error_col = col + 1;
 }
@@ -409,13 +411,13 @@ static bool cj5__parse_primitive(cj5__parser* parser, cj5_result* r, const char*
         }
 
         if (json5[parser->pos] < 32 || json5[parser->pos] >= 127) {
-            cj5__set_error(r, CJ5_ERROR_INVALID, parser->line, parser->pos - line_start);
+            cj5__set_error(r, CJ5_ERROR_INVALID, parser->pos, parser->line, parser->pos - line_start);
             parser->pos = start;
             return false;
         }
     }
 
-    cj5__set_error(r, CJ5_ERROR_INCOMPLETE, parser->line, parser->pos - line_start);
+    cj5__set_error(r, CJ5_ERROR_INCOMPLETE, parser->pos, parser->line, parser->pos - line_start);
     parser->pos = start;
     return false;
 
@@ -454,14 +456,14 @@ found:
 
             if (cj5__isnum(json5[i])) {
                 if (i == start) {
-                    cj5__set_error(r, CJ5_ERROR_INVALID, parser->line, parser->pos - line_start);
+                    cj5__set_error(r, CJ5_ERROR_INVALID, parser->pos, parser->line, parser->pos - line_start);
                     parser->pos = start;
                     return false;
                 }
                 continue;
             }
 
-            cj5__set_error(r, CJ5_ERROR_INVALID, parser->line, parser->pos - line_start);
+            cj5__set_error(r, CJ5_ERROR_INVALID, parser->pos, parser->line, parser->pos - line_start);
             parser->pos = start;
             return false;
         }
@@ -492,7 +494,7 @@ found:
                 for (int i = start; i < parser->pos; i++) {
                     if (!(cj5__isrange(json5[i], '0', '9') || cj5__isrange(json5[i], 'A', 'F') ||
                           cj5__isrange(json5[i], 'a', 'f'))) {
-                        cj5__set_error(r, CJ5_ERROR_INVALID, parser->line,
+                        cj5__set_error(r, CJ5_ERROR_INVALID, parser->pos, parser->line,
                                        parser->pos - line_start);
                         parser->pos = start;
                         return false;
@@ -511,7 +513,7 @@ found:
                 for (int i = start_index; i < parser->pos; i++) {
                     if (json5[i] == '.') {
                         if (num_type == CJ5_TOKEN_NUMBER_FLOAT) {
-                            cj5__set_error(r, CJ5_ERROR_INVALID, parser->line,
+                            cj5__set_error(r, CJ5_ERROR_INVALID, parser->pos, parser->line,
                                            parser->pos - line_start);
                             parser->pos = start;
                             return false;
@@ -521,7 +523,7 @@ found:
                     }
 
                     if (!cj5__isnum(json5[i])) {
-                        cj5__set_error(r, CJ5_ERROR_INVALID, parser->line,
+                        cj5__set_error(r, CJ5_ERROR_INVALID, parser->pos, parser->line,
                                        parser->pos - line_start);
                         parser->pos = start;
                         return false;
@@ -598,7 +600,7 @@ static bool cj5__parse_string(cj5__parser* parser, cj5_result* r, const char* js
                     if (!((json5[parser->pos] >= 48 && json5[parser->pos] <= 57) ||   /* 0-9 */
                           (json5[parser->pos] >= 65 && json5[parser->pos] <= 70) ||   /* A-F */
                           (json5[parser->pos] >= 97 && json5[parser->pos] <= 102))) { /* a-f */
-                        cj5__set_error(r, CJ5_ERROR_INVALID, parser->line,
+                        cj5__set_error(r, CJ5_ERROR_INVALID, parser->pos, parser->line,
                                        parser->pos - line_start);
                         parser->pos = start;
                         return false;
@@ -613,7 +615,7 @@ static bool cj5__parse_string(cj5__parser* parser, cj5_result* r, const char* js
                 ++parser->line;
                 break;
             default:
-                cj5__set_error(r, CJ5_ERROR_INVALID, parser->line, parser->pos - line_start);
+                cj5__set_error(r, CJ5_ERROR_INVALID, parser->pos, parser->line, parser->pos - line_start);
                 parser->pos = start;
                 return false;
             }
@@ -702,13 +704,13 @@ cj5_result cj5_parse_with_factory(const char* json5, int len, cj5_factory factor
             if (parser.super_id != -1 &&
                 parser.tokens[parser.super_id].type == CJ5_TOKEN_STRING &&
                 parser.tokens[parser.super_id].size == 0) {
-                cj5__set_error(&r, CJ5_ERROR_INVALID, parser.line, parser.pos - parser.line);
+                cj5__set_error(&r, CJ5_ERROR_INVALID, parser.pos, parser.line, parser.pos - parser.line);
                 return r;
             }
             type = (c == '}' ? CJ5_TOKEN_OBJECT : CJ5_TOKEN_ARRAY);
 
             if (parser.next_id < 1) {
-                cj5__set_error(&r, CJ5_ERROR_INVALID, parser.line, parser.pos - parser.line);
+                cj5__set_error(&r, CJ5_ERROR_INVALID, parser.pos, parser.line, parser.pos - parser.line);
                 return r;
             }
 
@@ -716,7 +718,7 @@ cj5_result cj5_parse_with_factory(const char* json5, int len, cj5_factory factor
             for (;;) {
                 if (token->start != -1 && token->end == -1) {
                     if (token->type != type) {
-                        cj5__set_error(&r, CJ5_ERROR_INVALID, parser.line,
+                        cj5__set_error(&r, CJ5_ERROR_INVALID, parser.pos, parser.line,
                                        parser.pos - parser.line);
                         return r;
                     }
@@ -727,7 +729,7 @@ cj5_result cj5_parse_with_factory(const char* json5, int len, cj5_factory factor
 
                 if (token->parent_id == -1) {
                     if (token->type != type || parser.super_id == -1) {
-                        cj5__set_error(&r, CJ5_ERROR_INVALID, parser.line,
+                        cj5__set_error(&r, CJ5_ERROR_INVALID, parser.pos, parser.line,
                                        parser.pos - parser.line);
                         return r;
                     }
@@ -782,7 +784,7 @@ cj5_result cj5_parse_with_factory(const char* json5, int len, cj5_factory factor
                 // on a size-0 key string -> invalid JSON5.
                 if (parser.tokens[parser.super_id].type == CJ5_TOKEN_STRING &&
                     parser.tokens[parser.super_id].size == 0) {
-                    cj5__set_error(&r, CJ5_ERROR_INVALID, parser.line, parser.pos - parser.line);
+                    cj5__set_error(&r, CJ5_ERROR_INVALID, parser.pos, parser.line, parser.pos - parser.line);
                     return r;
                 }
                 if (parser.tokens[parser.super_id].type != CJ5_TOKEN_ARRAY &&
@@ -825,7 +827,7 @@ cj5_result cj5_parse_with_factory(const char* json5, int len, cj5_factory factor
         for (int i = parser.next_id - 1; i >= 0; i--) {
             // unmatched object or array ?
             if (parser.tokens[i].start != -1 && parser.tokens[i].end == -1) {
-                cj5__set_error(&r, CJ5_ERROR_INCOMPLETE, parser.line, parser.pos - parser.line);
+                cj5__set_error(&r, CJ5_ERROR_INCOMPLETE, parser.pos, parser.line, parser.pos - parser.line);
                 return r;
             }
         }

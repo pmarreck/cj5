@@ -124,47 +124,97 @@ pub fn parse(json: []const u8, tokens: []Token) Error!Result {
     };
 }
 
-/// Check if a JSON5 string is valid (syntactically correct).
-/// This is a convenience function that allocates temporary tokens on the stack.
-/// For large documents, use parse() with a pre-allocated token buffer.
-pub fn isValid(json: []const u8) bool {
-    // Use a reasonable stack buffer for tokens
-    var tokens: [4096]Token = undefined;
+/// Where and how an uncapped validation found the document invalid.
+pub const Failure = struct {
+    kind: enum { invalid, incomplete },
+    /// Byte offset into the input where cj5 detected the error.
+    offset: usize,
+};
 
-    const c_result = c.cj5_parse(
-        json.ptr,
-        @intCast(json.len),
-        @ptrCast(&tokens),
-        tokens.len,
-    );
+pub const Verdict = union(enum) {
+    valid: struct { num_tokens: usize },
+    invalid: Failure,
+};
 
-    // If we overflow, the JSON might still be valid, just larger than our buffer
-    // In that case, we can't determine validity with this simple check
-    if (c_result.@"error" == c.CJ5_ERROR_OVERFLOW) {
-        // For very large files, we'd need dynamic allocation
-        // For now, return true since the syntax was valid up to overflow
-        return true;
+/// Reasons validateAll could not reach a verdict; callers report these as
+/// limits of the check, never as valid or invalid.
+pub const ValidateAllError = error{
+    OutOfMemory,
+    /// cj5 indexes input with a C int, so longer input cannot be examined.
+    InputTooLarge,
+};
+
+/// Token store for cj5_parse_with_factory that grows through an allocator, so
+/// validation has no fixed token cap; records allocation failure separately
+/// from cj5's own overflow signal.
+const GrowStore = struct {
+    allocator: std.mem.Allocator,
+    list: std.ArrayList(c.cj5_token) = .empty,
+    out_of_memory: bool = false,
+
+    fn create(user: ?*anyopaque) callconv(.c) [*c]c.cj5_token {
+        const self: *GrowStore = @ptrCast(@alignCast(user.?));
+        return self.list.addOne(self.allocator) catch {
+            self.out_of_memory = true;
+            return null;
+        };
     }
 
-    return c_result.@"error" == c.CJ5_ERROR_NONE;
+    fn getAll(user: ?*anyopaque) callconv(.c) [*c]c.cj5_token {
+        const self: *GrowStore = @ptrCast(@alignCast(user.?));
+        return self.list.items.ptr;
+    }
+};
+
+/// Parse the whole document with allocator-grown token storage and return the
+/// raw C result with its token pointer cleared (the tokens are freed here).
+fn parseUncapped(allocator: std.mem.Allocator, json: []const u8) ValidateAllError!c.cj5_result {
+    if (json.len > std.math.maxInt(c_int)) return error.InputTooLarge;
+    var store: GrowStore = .{ .allocator = allocator };
+    defer store.list.deinit(allocator);
+    var r = c.cj5_parse_with_factory(json.ptr, @intCast(json.len), .{
+        .create_token = GrowStore.create,
+        .get_all = GrowStore.getAll,
+        .user_data = &store,
+    });
+    // The store refuses a token only when allocation fails, so cj5's overflow
+    // signal here always means memory ran out.
+    if (store.out_of_memory or r.@"error" == c.CJ5_ERROR_OVERFLOW) return error.OutOfMemory;
+    r.tokens = null;
+    return r;
 }
 
-/// Check if JSON5 is valid, with detailed error info on failure.
+/// Validate an entire JSON5 document with no token cap (memory grows with the
+/// token count). Returns valid, or invalid with the byte offset of the first
+/// error; errors mean no verdict was reached.
+pub fn validateAll(allocator: std.mem.Allocator, json: []const u8) ValidateAllError!Verdict {
+    const r = try parseUncapped(allocator, json);
+    return switch (r.@"error") {
+        c.CJ5_ERROR_NONE => .{ .valid = .{ .num_tokens = @intCast(r.num_tokens) } },
+        c.CJ5_ERROR_INCOMPLETE => .{ .invalid = .{ .kind = .incomplete, .offset = @intCast(r.error_offset) } },
+        else => .{ .invalid = .{ .kind = .invalid, .offset = @intCast(r.error_offset) } },
+    };
+}
+
+/// Check whether a whole JSON5 document is valid, using the page allocator for
+/// token storage. A bool cannot express "not checked", so out-of-memory and
+/// oversized input return false; use validateAll to tell those apart.
+pub fn isValid(json: []const u8) bool {
+    const v = validateAll(std.heap.page_allocator, json) catch return false;
+    return v == .valid;
+}
+
+/// Like isValid, with cj5's line/column report on failure. Out-of-memory and
+/// oversized input report invalid with line and column 0; use validateAll to
+/// tell those apart.
 pub fn validate(json: []const u8) struct { valid: bool, error_line: c_int, error_col: c_int, num_tokens: c_int } {
-    var tokens: [4096]Token = undefined;
-
-    const c_result = c.cj5_parse(
-        json.ptr,
-        @intCast(json.len),
-        @ptrCast(&tokens),
-        tokens.len,
-    );
-
+    const r = parseUncapped(std.heap.page_allocator, json) catch
+        return .{ .valid = false, .error_line = 0, .error_col = 0, .num_tokens = 0 };
     return .{
-        .valid = c_result.@"error" == c.CJ5_ERROR_NONE or c_result.@"error" == c.CJ5_ERROR_OVERFLOW,
-        .error_line = c_result.error_line,
-        .error_col = c_result.error_col,
-        .num_tokens = c_result.num_tokens,
+        .valid = r.@"error" == c.CJ5_ERROR_NONE,
+        .error_line = r.error_line,
+        .error_col = r.error_col,
+        .num_tokens = r.num_tokens,
     };
 }
 
@@ -325,9 +375,9 @@ test "parse returns error.Overflow when token buffer is too small" {
     try std.testing.expectError(error.Overflow, parse(json, &tokens));
 }
 
-test "isValid/validate are lenient on token overflow (pins current behavior)" {
+test "isValid/validate check valid documents past the old 4096-token buffer" {
     // Build a flat array of 5000 numbers => 5001 tokens, which exceeds the
-    // internal 4096-token stack buffer used by isValid()/validate().
+    // 4096-token stack buffer isValid()/validate() used before validateAll.
     // Layout: '[' + "1" + 4999*(",1") + ']' = 1 + 1 + 9998 + 1 = 10001 bytes.
     const big = try std.testing.allocator.alloc(u8, 10001);
     defer std.testing.allocator.free(big);
@@ -351,11 +401,8 @@ test "isValid/validate are lenient on token overflow (pins current behavior)" {
     var buf4096: [4096]Token = undefined;
     try std.testing.expectError(error.Overflow, parse(big, &buf4096));
 
-    // Current (lenient) contract: syntactically-valid input that overflows the
-    // internal buffer is reported as VALID by both isValid() and validate()
-    // (see the comments in those functions). This test pins that behavior so a
-    // future policy change — treating overflow as invalid — must update it
-    // deliberately rather than silently.
+    // The document is valid and is now checked in full, not assumed valid on
+    // overflow; the invalid counterpart is the validateAll test further down.
     try std.testing.expect(isValid(big));
     try std.testing.expect(validate(big).valid);
 }
@@ -443,4 +490,61 @@ test "factory parse agrees with fixed-buffer parse, including fork validity fixe
             }
         }
     }
+}
+
+/// Builds "[1,1,...,1<tail>]" with `count` ones, so the document needs more
+/// tokens than any fixed buffer while `tail` places an error after them.
+fn buildBigArray(allocator: std.mem.Allocator, count: usize, tail: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (0..count) |i| {
+        if (i != 0) try out.append(allocator, ',');
+        try out.append(allocator, '1');
+    }
+    try out.appendSlice(allocator, tail);
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+test "validateAll checks a document past the old 4096-token cap" {
+    const big = try buildBigArray(std.testing.allocator, 5000, "");
+    defer std.testing.allocator.free(big);
+    const v = try validateAll(std.testing.allocator, big);
+    try expectEqual(@as(usize, 5001), v.valid.num_tokens);
+}
+
+test "validateAll reports an error after token 4096 as invalid at its byte offset" {
+    // Missing object value after 5000 array elements: the '}' is the error.
+    const big = try buildBigArray(std.testing.allocator, 5000, ",{a: }");
+    defer std.testing.allocator.free(big);
+    const brace = std.mem.lastIndexOfScalar(u8, big, '}').?;
+    const v = try validateAll(std.testing.allocator, big);
+    try expectEqual(Failure{ .kind = .invalid, .offset = brace }, v.invalid);
+    // The bool conveniences must never call this document valid.
+    try std.testing.expect(!isValid(big));
+    try std.testing.expect(!validate(big).valid);
+}
+
+test "validateAll reports small invalid and incomplete documents with offsets" {
+    const missing = "{a: }";
+    try expectEqual(Failure{ .kind = .invalid, .offset = 4 }, (try validateAll(std.testing.allocator, missing)).invalid);
+    const open = "{a: 1";
+    try expectEqual(Failure{ .kind = .incomplete, .offset = open.len }, (try validateAll(std.testing.allocator, open)).invalid);
+    const ok = "{a: [1, 'x']}";
+    // object, key "a", array, 1, 'x' (cj5 counts keys as tokens)
+    try expectEqual(@as(usize, 5), (try validateAll(std.testing.allocator, ok)).valid.num_tokens);
+}
+
+test "validateAll surfaces allocation failure instead of a verdict" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, validateAll(failing.allocator(), "{a: 1}"));
+}
+
+test "validateAll rejects input longer than cj5's int length as InputTooLarge" {
+    // Only the length is inspected; the bytes past the first are never read.
+    const byte: u8 = '{';
+    const p: [*]const u8 = @ptrCast(&byte);
+    const huge = p[0 .. @as(usize, std.math.maxInt(c_int)) + 1];
+    try std.testing.expectError(error.InputTooLarge, validateAll(std.testing.allocator, huge));
 }
