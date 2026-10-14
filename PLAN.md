@@ -11,7 +11,7 @@ Open work for the cj5 fork, in priority order. Completed items retire to `docs/P
 ## Large-document validity (requested by validate)
 
 - [x] Add uncapped `validateAll` (allocator-grown tokens, byte offset of first error) and stop `isValid`/`validate` reporting overflow as valid (done 2026-10-14 17:35 EDT)
-- [ ] Reply to validate with the pushed SHA and the new API shape
+- [x] Reply to validate with the pushed SHA and the new API shape (done 2026-10-14 17:38 EDT, 3a32d25)
 
 ## Housekeeping
 
