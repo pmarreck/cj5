@@ -100,6 +100,8 @@ pub const Result = struct {
 /// Returns an error if parsing fails, otherwise returns a Result with the parsed tokens.
 /// The tokens slice must be large enough to hold all tokens; if not, returns error.Overflow.
 pub fn parse(json: []const u8, tokens: []Token) Error!Result {
+    // cj5_parse asserts max_tokens > 0; an empty buffer simply has no room.
+    if (tokens.len == 0) return error.Overflow;
     const c_result = c.cj5_parse(
         json.ptr,
         @intCast(json.len),
@@ -378,4 +380,67 @@ test "whitespace between unquoted key and colon is valid (JSON5)" {
 
     // Regression guard: a missing value with whitespace is still invalid.
     try std.testing.expect(!isValid("{a : }"));
+}
+
+test "parse with an empty token slice returns error.Overflow" {
+    // Upstream cj5_parse asserts max_tokens > 0; the Zig wrapper must keep the
+    // empty-buffer case a recoverable error rather than an assertion abort.
+    var tokens: [0]Token = .{};
+    try std.testing.expectError(error.Overflow, parse("{a: 1}", &tokens));
+}
+
+/// Growable token store for the raw cj5_parse_with_factory API. It reallocates
+/// on every growth so any parser code holding a stale token pointer is caught.
+const GrowingFactory = struct {
+    list: std.ArrayList(c.cj5_token) = .empty,
+    fn create(user: ?*anyopaque) callconv(.c) [*c]c.cj5_token {
+        const self: *GrowingFactory = @ptrCast(@alignCast(user.?));
+        const old = self.list.items;
+        var fresh = std.testing.allocator.alloc(c.cj5_token, old.len + 1) catch return null;
+        @memcpy(fresh[0..old.len], old);
+        self.list.deinit(std.testing.allocator);
+        self.list = .fromOwnedSlice(fresh);
+        return &fresh[old.len];
+    }
+    fn getAll(user: ?*anyopaque) callconv(.c) [*c]c.cj5_token {
+        const self: *GrowingFactory = @ptrCast(@alignCast(user.?));
+        return self.list.items.ptr;
+    }
+};
+
+test "factory parse agrees with fixed-buffer parse, including fork validity fixes" {
+    // Differential check: the upstream token-factory path must produce the same
+    // verdict and tokens as the fixed-buffer path for valid and invalid inputs.
+    const cases = [_][]const u8{
+        "{a : 1, b: [1, 2, {c: 'x'}], d: null}",
+        "{a: 1, b : 2}",
+        "{a: }",
+        "{a: , b: 1}",
+        "{a : }",
+        "[1, 2,]",
+        "{a: 1",
+    };
+    for (cases) |json| {
+        var fixed: [64]c.cj5_token = undefined;
+        const r1 = c.cj5_parse(json.ptr, @intCast(json.len), &fixed, fixed.len);
+
+        var gf: GrowingFactory = .{};
+        defer gf.list.deinit(std.testing.allocator);
+        const factory: c.cj5_factory = .{
+            .create_token = GrowingFactory.create,
+            .get_all = GrowingFactory.getAll,
+            .user_data = &gf,
+        };
+        const r2 = c.cj5_parse_with_factory(json.ptr, @intCast(json.len), factory);
+
+        try expectEqual(r1.@"error", r2.@"error");
+        try expectEqual(r1.num_tokens, r2.num_tokens);
+        if (r1.@"error" == c.CJ5_ERROR_NONE) {
+            const n: usize = @intCast(r1.num_tokens);
+            for (fixed[0..n], gf.list.items[0..n]) |a, b| {
+                // Both paths memset each token to zero, so whole-token bytes must match.
+                try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+            }
+        }
+    }
 }

@@ -4,7 +4,7 @@
 //
 // MIT License
 //
-// Copyright (c) 2020 Sepehr Taghdisian
+// Copyright (c) 2026 Sepehr Taghdisian
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -61,7 +61,13 @@
 //          // use token helper functions (see below) to access the values 
 //          float my_num = cj5_seekget_float(&r, 0, "my_num", 0 /* default value if not found*/ );
 //        } 
-// 
+//
+// Token factory:
+//      To dynamically allocate tokens while parsing. You can use `cj5_parse_with_factory` and provide it with cj5_factory callbacks:
+//      Factory can be a dynamically growing array (std::vector) that allocate tokens instead of allocating them up front
+//          create_token: Allocates a token and returns it's pointer.
+//          get_all: returns the pointer to all tokens allocated. 
+//     
 // Customization:
 //  This library doesn't use any memory allocations so hooray for that !
 //  But in order to not use default stdc functions, you can override those by defining these macros:
@@ -134,6 +140,12 @@ typedef struct cj5_token {
     int parent_id;      // = -1 if there is no parent
 } cj5_token;
 
+typedef struct cj5_factory {
+    cj5_token* (*create_token)(void* user);
+    cj5_token* (*get_all)(void* user);
+    void* user_data;
+} cj5_factory;
+
 typedef struct cj5_result {
     cj5_error_code error;
     int error_line;
@@ -144,6 +156,7 @@ typedef struct cj5_result {
 } cj5_result;
 
 CJ5_API cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_tokens);
+CJ5_API cj5_result cj5_parse_with_factory(const char* json5, int len, cj5_factory factory);
 
 // token helpers
 #if CJ5_TOKEN_HELPERS
@@ -236,6 +249,8 @@ typedef struct cj5__parser {
     int next_id;
     int super_id;
     int line;
+    cj5_token* tokens;
+    cj5_factory token_factory;
 } cj5__parser;
 
 static inline uint32_t cj5__hash_fnv32(const char* start, const char* end)
@@ -342,14 +357,16 @@ CJ5_SKIP_ASAN static int cj5__strlen(const char* str)
     #endif
 }
 
-static inline cj5_token* cj5__alloc_token(cj5__parser* parser, cj5_token* tokens, int max_tokens)
+static inline cj5_token* cj5__alloc_token(cj5__parser* parser)
 {
-    if (!tokens || parser->next_id >= max_tokens) {
+    cj5_token* token = parser->token_factory.create_token(parser->token_factory.user_data);
+    if (!token)
         return NULL;
-    }
-
-    cj5_token* token = &tokens[parser->next_id++];
     CJ5_MEMSET(token, 0x0, sizeof(cj5_token));
+
+    ++parser->next_id;
+    parser->tokens = parser->token_factory.get_all(parser->token_factory.user_data);
+
     token->start = -1;
     token->end = -1;
     token->parent_id = -1;
@@ -363,8 +380,7 @@ static inline void cj5__set_error(cj5_result* r, cj5_error_code code, int line, 
     r->error_col = col + 1;
 }
 
-static bool cj5__parse_primitive(cj5__parser* parser, cj5_result* r, const char* json5, int len,
-                                 cj5_token* tokens, int max_tokens)
+static bool cj5__parse_primitive(cj5__parser* parser, cj5_result* r, const char* json5, int len)
 {
     cj5_token* token;
     int start = parser->pos;
@@ -420,7 +436,7 @@ found:
         }
     }
 
-    token = cj5__alloc_token(parser, tokens, max_tokens);
+    token = cj5__alloc_token(parser);
     if (token == NULL) {
         r->error = CJ5_ERROR_OVERFLOW;
         --parser->pos;
@@ -454,8 +470,12 @@ found:
     } else {
         // detect other types, subtypes
         // note that we have to use memcpy here or we will get unaligned access on some
-        uint32_t fourcc_;
-        CJ5_MEMCPY(&fourcc_, &json5[start], 4);
+        uint32_t fourcc_ = 0;
+        if (parser->pos - start >= 4)
+            CJ5_MEMCPY(&fourcc_, &json5[start], 4);
+        else
+            CJ5_MEMCPY(&fourcc_, &json5[start], parser->pos - start);
+
         uint32_t* fourcc = &fourcc_;
  
         if (*fourcc == CJ5__NULL_FOURCC) {
@@ -532,8 +552,7 @@ found:
     return true;
 }
 
-static bool cj5__parse_string(cj5__parser* parser, cj5_result* r, const char* json5, int len,
-                              cj5_token* tokens, int max_tokens)
+static bool cj5__parse_string(cj5__parser* parser, cj5_result* r, const char* json5, int len)
 {
     cj5_token* token;
     int start = parser->pos;
@@ -546,7 +565,7 @@ static bool cj5__parse_string(cj5__parser* parser, cj5_result* r, const char* js
 
         // end of string
         if (str_open == c) {
-            token = cj5__alloc_token(parser, tokens, max_tokens);
+            token = cj5__alloc_token(parser);
             if (token == NULL) {
                 r->error = CJ5_ERROR_OVERFLOW;
                 return true;
@@ -623,11 +642,14 @@ static void cj5__skip_multiline_comment(cj5__parser* parser, const char* json5, 
     }
 }
 
-cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_tokens)
+cj5_result cj5_parse_with_factory(const char* json5, int len, cj5_factory factory)
 {
+    CJ5_ASSERT(json5);
+
     cj5__parser parser;
     CJ5_MEMSET(&parser, 0x0, sizeof(parser));
     parser.super_id = -1;
+    parser.token_factory = factory;
 
     cj5_result r;
     CJ5_MEMSET(&r, 0x0, sizeof(r));
@@ -646,14 +668,14 @@ cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_toke
         case '[':
             can_comment = false;
             count++;
-            token = cj5__alloc_token(&parser, tokens, max_tokens);
+            token = cj5__alloc_token(&parser);
             if (token == NULL) {
                 r.error = CJ5_ERROR_OVERFLOW;
                 break;
             }
 
             if (parser.super_id != -1) {
-                cj5_token* super_token = &tokens[parser.super_id];
+                cj5_token* super_token = &parser.tokens[parser.super_id];
                 token->parent_id = parser.super_id;
                 if (++super_token->size == 1 && super_token->type == CJ5_TOKEN_STRING) {
                     super_token->key_hash =
@@ -671,15 +693,15 @@ cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_toke
         case '}':
         case ']':
             can_comment = false;
-            if (!tokens || r.error == CJ5_ERROR_OVERFLOW) {
+            if (r.error == CJ5_ERROR_OVERFLOW) {
                 break;
             }
             // JSON5: a 'key:' must be followed by a value before the container
             // closes. If super_id still points to a key string with no value
             // attached (size == 0), the value is missing -> invalid.
             if (parser.super_id != -1 &&
-                tokens[parser.super_id].type == CJ5_TOKEN_STRING &&
-                tokens[parser.super_id].size == 0) {
+                parser.tokens[parser.super_id].type == CJ5_TOKEN_STRING &&
+                parser.tokens[parser.super_id].size == 0) {
                 cj5__set_error(&r, CJ5_ERROR_INVALID, parser.line, parser.pos - parser.line);
                 return r;
             }
@@ -690,7 +712,7 @@ cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_toke
                 return r;
             }
 
-            token = &tokens[parser.next_id - 1];
+            token = &parser.tokens[parser.next_id - 1];
             for (;;) {
                 if (token->start != -1 && token->end == -1) {
                     if (token->type != type) {
@@ -712,7 +734,7 @@ cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_toke
                     break;
                 }
 
-                token = &tokens[token->parent_id];
+                token = &parser.tokens[token->parent_id];
             }
             break;
 
@@ -720,19 +742,19 @@ cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_toke
         case '\'':
             can_comment = false;
             // JSON5: strings can start with \" or \'
-            cj5__parse_string(&parser, &r, json5, len, tokens, max_tokens);
+            cj5__parse_string(&parser, &r, json5, len);
             if (r.error && r.error != CJ5_ERROR_OVERFLOW) {
                 return r;
             }
             count++;
-            if (parser.super_id != -1 && tokens && r.error != CJ5_ERROR_OVERFLOW) {
-                if (++tokens[parser.super_id].size == 1 &&
-                    tokens[parser.super_id].type == CJ5_TOKEN_STRING) {
+            if (parser.super_id != -1 && r.error != CJ5_ERROR_OVERFLOW) {
+                if (++parser.tokens[parser.super_id].size == 1 &&
+                    parser.tokens[parser.super_id].type == CJ5_TOKEN_STRING) {
                     // it's not a value, it's a key, so hash it
-                    tokens[parser.super_id].key_hash = cj5__hash_fnv32(
-                        &json5[tokens[parser.super_id].start], &json5[tokens[parser.super_id].end]);
-                    tokens[parser.super_id].key_start = tokens[parser.super_id].start;
-                    tokens[parser.super_id].key_end = tokens[parser.super_id].end;
+                    parser.tokens[parser.super_id].key_hash = cj5__hash_fnv32(
+                        &json5[parser.tokens[parser.super_id].start], &json5[parser.tokens[parser.super_id].end]);
+                    parser.tokens[parser.super_id].key_start = parser.tokens[parser.super_id].start;
+                    parser.tokens[parser.super_id].key_end = parser.tokens[parser.super_id].end;
                 }
             }
             break;
@@ -755,17 +777,17 @@ cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_toke
 
         case ',':
             can_comment = false;
-            if (tokens != NULL && parser.super_id != -1 && r.error != CJ5_ERROR_OVERFLOW) {
+            if (parser.super_id != -1 && r.error != CJ5_ERROR_OVERFLOW) {
                 // Missing value: 'key:' immediately followed by ',' leaves super_id
                 // on a size-0 key string -> invalid JSON5.
-                if (tokens[parser.super_id].type == CJ5_TOKEN_STRING &&
-                    tokens[parser.super_id].size == 0) {
+                if (parser.tokens[parser.super_id].type == CJ5_TOKEN_STRING &&
+                    parser.tokens[parser.super_id].size == 0) {
                     cj5__set_error(&r, CJ5_ERROR_INVALID, parser.line, parser.pos - parser.line);
                     return r;
                 }
-                if (tokens[parser.super_id].type != CJ5_TOKEN_ARRAY &&
-                    tokens[parser.super_id].type != CJ5_TOKEN_OBJECT) {
-                    parser.super_id = tokens[parser.super_id].parent_id;
+                if (parser.tokens[parser.super_id].type != CJ5_TOKEN_ARRAY &&
+                    parser.tokens[parser.super_id].type != CJ5_TOKEN_OBJECT) {
+                    parser.super_id = parser.tokens[parser.super_id].parent_id;
                 }
             }
             break;
@@ -780,29 +802,29 @@ cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_toke
             break;
 
         default:
-            cj5__parse_primitive(&parser, &r, json5, len, tokens, max_tokens);
+            cj5__parse_primitive(&parser, &r, json5, len);
             if (r.error && r.error != CJ5_ERROR_OVERFLOW) {
                 return r;
             }
             can_comment = false;
             count++;
-            if (parser.super_id != -1 && tokens && r.error != CJ5_ERROR_OVERFLOW) {
-                if (++tokens[parser.super_id].size == 1 &&
-                    tokens[parser.super_id].type == CJ5_TOKEN_STRING) {
-                    tokens[parser.super_id].key_hash = cj5__hash_fnv32(
-                        &json5[tokens[parser.super_id].start], &json5[tokens[parser.super_id].end]);
-                    tokens[parser.super_id].key_start = tokens[parser.super_id].start;
-                    tokens[parser.super_id].key_end = tokens[parser.super_id].end;
+            if (parser.super_id != -1 && r.error != CJ5_ERROR_OVERFLOW) {
+                if (++parser.tokens[parser.super_id].size == 1 &&
+                    parser.tokens[parser.super_id].type == CJ5_TOKEN_STRING) {
+                    parser.tokens[parser.super_id].key_hash = cj5__hash_fnv32(
+                        &json5[parser.tokens[parser.super_id].start], &json5[parser.tokens[parser.super_id].end]);
+                    parser.tokens[parser.super_id].key_start = parser.tokens[parser.super_id].start;
+                    parser.tokens[parser.super_id].key_end = parser.tokens[parser.super_id].end;
                 }
             }
             break;
         }
     }
 
-    if (tokens && r.error != CJ5_ERROR_OVERFLOW) {
+    if (r.error != CJ5_ERROR_OVERFLOW) {
         for (int i = parser.next_id - 1; i >= 0; i--) {
             // unmatched object or array ?
-            if (tokens[i].start != -1 && tokens[i].end == -1) {
+            if (parser.tokens[i].start != -1 && parser.tokens[i].end == -1) {
                 cj5__set_error(&r, CJ5_ERROR_INCOMPLETE, parser.line, parser.pos - parser.line);
                 return r;
             }
@@ -810,11 +832,51 @@ cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_toke
     }
 
     r.num_tokens = count;
-    r.tokens = tokens;
+    r.tokens = parser.tokens;
     r.json5 = json5;
     return r;
 }
 
+typedef struct cj5_factory_default {
+    cj5_token* tokens;
+    int max_tokens;
+    int index;
+} cj5_factory_default;
+
+static cj5_token* cj5_factory_default_create_fn(void* user)
+{
+    cj5_factory_default* factory = (cj5_factory_default*)user;
+
+    if (factory->index < factory->max_tokens)
+        return &factory->tokens[factory->index++];
+    else
+        return NULL;
+}
+
+static cj5_token* cj5_factory_default_getall_fn(void* user)
+{
+    cj5_factory_default* factory = (cj5_factory_default*)user;
+    return factory->tokens;
+}
+
+cj5_result cj5_parse(const char* json5, int len, cj5_token* tokens, int max_tokens)
+{
+    CJ5_ASSERT(json5);
+    CJ5_ASSERT(tokens);
+    CJ5_ASSERT(max_tokens > 0);
+
+    cj5_factory factory;
+    cj5_factory_default factory_data;
+    factory_data.tokens = tokens;
+    factory_data.max_tokens = max_tokens;
+    factory_data.index = 0;
+
+    factory.create_token = cj5_factory_default_create_fn;
+    factory.get_all = cj5_factory_default_getall_fn;
+    factory.user_data = &factory_data;
+
+    return cj5_parse_with_factory(json5, len, factory);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Helper functions to work with tokens
